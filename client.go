@@ -3479,16 +3479,12 @@ func (c *pipelineConnClient) reader(conn net.Conn, stopCh <-chan struct{}, chs *
 			}
 		}
 		// A response to HEAD carries no body no matter what Content-Length
-		// or Transfer-Encoding announce (RFC 9112 section 6.3). Reading one
-		// here would consume the following pipelined responses as the body,
-		// the same reason transport.RoundTrip skips it.
-		//
-		// A body skipped by the caller still has to be consumed: left on the
-		// connection, it would be read as the start of the next pipelined
-		// response. Drain it without buffering it.
-		skipBody := w.resp.SkipBody
-		isHead := w.req.Header.IsHead()
-		w.resp.SkipBody = skipBody || isHead
+		// or Transfer-Encoding announce (RFC 9112 section 6.3), and neither
+		// does a 2xx response to CONNECT. Reading one here would consume the
+		// following pipelined responses as the body, the same reason
+		// transport.RoundTrip skips it.
+		w.resp.headResponse = w.req.Header.IsHead()
+		w.resp.connectResponse = w.req.Header.IsConnect()
 		// PipelineClient must consume each response body before reading the
 		// next response from the shared connection. Preserve StreamBody's
 		// reader API with a buffered stream instead of leaving bytes in br.
@@ -3496,14 +3492,13 @@ func (c *pipelineConnClient) reader(conn net.Conn, stopCh <-chan struct{}, chs *
 		w.resp.StreamBody = false
 		err = w.resp.ReadLimitBody(br, c.MaxResponseBodySize)
 		w.resp.StreamBody = streamBody
-		w.resp.SkipBody = skipBody
-		if skipBody && !isHead {
-			w.resp.ResetBody()
-			if err == nil {
-				err = w.resp.discardBody(br, c.MaxResponseBodySize)
-			}
+		// A body skipped by the caller still has to be consumed: left on the
+		// connection, it would be read as the start of the next pipelined
+		// response. Drain it without buffering it.
+		if err == nil && w.resp.SkipBody {
+			err = w.resp.discardBody(br, c.MaxResponseBodySize)
 		}
-		if err == nil && streamBody && !isHead && !w.resp.mustSkipBody() {
+		if err == nil && streamBody && !w.resp.mustSkipBody() {
 			w.resp.bodyStream = bytes.NewReader(w.resp.bodyBytes())
 		}
 		if err != nil {
@@ -3512,7 +3507,14 @@ func (c *pipelineConnClient) reader(conn net.Conn, stopCh <-chan struct{}, chs *
 			return err
 		}
 
+		// After a 2xx response to CONNECT the connection is a tunnel, so no
+		// further pipelined response can be read from it. Check before
+		// signaling done: w may be reused as soon as the caller wakes up.
+		tunnel := w.resp.isConnectTunnel()
 		w.done <- struct{}{}
+		if tunnel {
+			return nil
+		}
 	}
 }
 
@@ -3687,18 +3689,14 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	isHead := req.Header.IsHead()
-	if customSkipBody || isHead {
-		resp.SkipBody = true
-	}
+	resp.headResponse = isHead
+	resp.connectResponse = req.Header.IsConnect()
 	if hc.DisableHeaderNamesNormalizing {
 		resp.Header.DisableNormalizing()
 	}
 
 	br := hc.AcquireReader(conn)
 	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
-	// SkipBody is only turned on here for this HEAD request. Leaving it set
-	// would make the next request that reuses resp skip its response body.
-	resp.SkipBody = customSkipBody
 	if err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
@@ -3707,7 +3705,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		return needRetry, err
 	}
 
-	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose()
+	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose() || resp.isConnectTunnel()
 	if customSkipBody && !isHead && !resp.Header.mustSkipContentLength() && resp.Header.ContentLength() != 0 {
 		// The body of this response was left unread on the connection,
 		// so the next response read from it would start inside that body.

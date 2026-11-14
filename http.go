@@ -190,6 +190,13 @@ type Response struct {
 
 	preserveBodyBuffer    bool
 	secureErrorLogMessage bool
+
+	// headResponse and connectResponse are set by the clients when the
+	// response answers a HEAD or CONNECT request. Unlike SkipBody they are
+	// cleared by Reset, so they don't leak into the next request that reuses
+	// the response.
+	headResponse    bool
+	connectResponse bool
 }
 
 // SetHost sets host for the request.
@@ -1171,6 +1178,8 @@ func (resp *Response) copyToSkipBody(dst *Response) {
 	dst.Reset()
 	resp.Header.CopyTo(&dst.Header)
 	dst.SkipBody = resp.SkipBody
+	dst.headResponse = resp.headResponse
+	dst.connectResponse = resp.connectResponse
 	dst.raddr = resp.raddr
 	dst.laddr = resp.laddr
 }
@@ -1548,6 +1557,8 @@ func (resp *Response) Reset() {
 	resp.resetSkipHeader()
 	resp.Header.Reset()
 	resp.SkipBody = false
+	resp.headResponse = false
+	resp.connectResponse = false
 	resp.raddr = nil
 	resp.laddr = nil
 	resp.ImmediateHeaderFlush = false
@@ -1931,7 +1942,7 @@ func (resp *Response) ReadBody(r *bufio.Reader, maxBodySize int) (err error) {
 // response. It enforces the same framing and maxBodySize rules as ReadBody,
 // and reads the trailer of a chunked body.
 func (resp *Response) discardBody(r *bufio.Reader, maxBodySize int) error {
-	if resp.Header.mustSkipContentLength() {
+	if resp.headResponse || resp.isConnectTunnel() || resp.Header.mustSkipContentLength() {
 		return nil
 	}
 	contentLength := resp.Header.ContentLength()
@@ -2032,7 +2043,14 @@ func discardBodyIdentity(r *bufio.Reader, maxBodySize int) error {
 }
 
 func (resp *Response) mustSkipBody() bool {
-	return resp.SkipBody || resp.Header.mustSkipContentLength()
+	return resp.SkipBody || resp.headResponse || resp.isConnectTunnel() || resp.Header.mustSkipContentLength()
+}
+
+// isConnectTunnel reports whether resp is a 2xx response to CONNECT. Such a
+// response ends at its header: the connection becomes a tunnel afterwards
+// (RFC 9110 section 9.3.6).
+func (resp *Response) isConnectTunnel() bool {
+	return resp.connectResponse && resp.Header.StatusCode() >= 200 && resp.Header.StatusCode() < 300
 }
 
 var errRequestHostRequired = errors.New("missing required host header in request")
